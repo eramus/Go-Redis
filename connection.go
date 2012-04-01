@@ -304,10 +304,10 @@ const (
 	_
 	_
 	_
-	Reqerr
-	Inierr
-	Snderr
-	Rcverr
+	reqerr
+	inierr
+	snderr
+	rcverr
 )
 
 // Defines the data corresponding to a requested service call through the
@@ -480,7 +480,7 @@ func heartbeatTask(w worker.Worker, ctl worker.WorkerCtl) (sig *worker.Interrupt
 	case <-time.NewTimer(c.super.spec.heartbeat).C:
 		response, e := async.QueueRequest(&PING, [][]byte{})
 		if e != nil {
-			return nil, &worker.TaskStatus{Reqerr, e}
+			return nil, &worker.TaskStatus{reqerr, e}
 		}
 		stat, re, timedout := response.future.(FutureBool).TryGet(1 * time.Second)
 		if re != nil {
@@ -529,10 +529,10 @@ func rspProcessingTask(w worker.Worker, ctl worker.WorkerCtl) (sig *worker.Inter
 	if e3 != nil {
 		// system error
 		log.Println("<TEMP DEBUG> Request sent to faults chan on error in GetResponse: ", e3)
-		req.stat = Rcverr
+		req.stat = rcverr
 		req.error = NewErrorWithCause(SYSTEM_ERR, "GetResponse os.Error", e3)
 		c.faults <- req
-		return nil, &worker.TaskStatus{Rcverr, e3}
+		return nil, &worker.TaskStatus{rcverr, e3}
 	}
 	SetFutureResult(req.future, cmd, resp)
 
@@ -594,7 +594,7 @@ done:
 
 proc_error:
 	log.Println(errmsg, err)
-	return nil, &worker.TaskStatus{Snderr, err}
+	return nil, &worker.TaskStatus{snderr, err}
 }
 
 func (c *asyncConnHdl) processAsyncRequest(req asyncReqPtr) (blen int, e error) {
@@ -655,7 +655,7 @@ func (c *asyncConnHdl) QueueRequest(cmd *Command, args [][]byte) (*PendingRespon
 		c.pendingReqs <- request
 	} else {
 		errmsg := fmt.Sprintf("Failed to create asynchrequest - %s aborted", cmd.Code)
-		request.stat = Inierr
+		request.stat = inierr
 		request.error = NewErrorWithCause(SYSTEM_ERR, errmsg, e1) // only makes sense if using go ...
 		request.future.(FutureResult).onError(request.error)
 
