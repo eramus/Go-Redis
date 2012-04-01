@@ -22,6 +22,8 @@ import (
 	"net"
 	//	"os"
 	"time"
+
+	"github.com/eramus/worker"
 )
 
 const (
@@ -296,61 +298,24 @@ func (chdl *connHdl) ServiceRequest(cmd *Command, args [][]byte) (resp Response,
 // Asynchronous connections
 // ----------------------------------------------------------------------------
 
-type status_code byte
-
 const (
-	ok status_code = iota
-	info
-	warning
-	error_
-	reqerr
-	inierr
-	snderr
-	rcverr
+	_ worker.StatusCode = iota
+	_
+	_
+	_
+	_
+	Reqerr
+	Inierr
+	Snderr
+	Rcverr
 )
-
-type interrupt_code byte
-
-const (
-	_ interrupt_code = iota
-	// connection process control
-	start
-	pause
-	stop
-)
-
-type workerCtl chan interrupt_code
-
-type event_code byte
-
-const (
-	_ event_code = iota
-	ready
-	working
-	faulted
-)
-
-type workerStatus struct {
-	id       int
-	event    event_code
-	taskinfo *taskStatus
-	ctlchan  *workerCtl
-}
-type taskStatus struct {
-	code  status_code
-	error error
-}
-
-var ok_status = taskStatus{ok, nil}
-
-type workerTask func(*asyncConnHdl, workerCtl) (*interrupt_code, *taskStatus)
 
 // Defines the data corresponding to a requested service call through the
 // QueueRequest method of AsyncConnection
 // not used yet.
 type asyncRequestInfo struct {
 	id      int64
-	stat    status_code
+	stat    worker.StatusCode
 	cmd     *Command
 	outbuff *[]byte
 	future  interface{}
@@ -367,6 +332,7 @@ const (
 )
 
 type asyncConnHdl struct {
+	worker.Base
 	super  *connHdl
 	writer *bufio.Writer
 
@@ -374,15 +340,6 @@ type asyncConnHdl struct {
 	pendingReqs  chan asyncReqPtr
 	pendingResps chan asyncReqPtr
 	faults       chan asyncReqPtr
-
-	reqProcCtl   workerCtl
-	rspProcCtl   workerCtl
-	heartbeatCtl workerCtl
-	managerCtl   workerCtl
-
-	feedback chan workerStatus
-
-	shutdown chan bool
 }
 
 // Creates a new asyncConnHdl with a new connHdl as its delegated 'super'.
@@ -401,14 +358,6 @@ func newAsyncConnHdl(spec *ConnectionSpec) (async *asyncConnHdl, err Error) {
 			async.pendingReqs = make(chan asyncReqPtr, spec.reqChanCap)
 			async.pendingResps = make(chan asyncReqPtr, spec.rspChanCap)
 			async.faults = make(chan asyncReqPtr, spec.reqChanCap) // not sure about sizing here ...
-
-			async.reqProcCtl = make(workerCtl)
-			async.rspProcCtl = make(workerCtl)
-			async.heartbeatCtl = make(workerCtl)
-			async.managerCtl = make(workerCtl)
-
-			async.feedback = make(chan workerStatus)
-			async.shutdown = make(chan bool, 1)
 
 			return
 		}
@@ -430,6 +379,7 @@ func NewAsynchConnection(spec *ConnectionSpec) (conn AsyncConnection, err Error)
 	if async, err = newAsyncConnHdl(spec); err == nil {
 		async.onConnect()
 		async.startup()
+		go async.Run()
 	}
 	return async, err
 }
@@ -444,88 +394,36 @@ func (c *asyncConnHdl) onDisconnect() (e Error) {
 	return
 }
 
-// responsible for managing the various moving parts of the asyncConnHdl
-func (c *asyncConnHdl) startup() {
-
-	go c.worker(manager, "manager", managementTask, c.managerCtl, nil)
-	c.managerCtl <- start
-
-	go c.worker(heartbeatworker, "heartbeat", heartbeatTask, c.heartbeatCtl, c.feedback)
-	c.heartbeatCtl <- start
-
-	go c.worker(heartbeatworker, "request-processor", reqProcessingTask, c.reqProcCtl, c.feedback)
-	c.reqProcCtl <- start
-
-	go c.worker(heartbeatworker, "response-processor", rspProcessingTask, c.rspProcCtl, c.feedback)
-	c.rspProcCtl <- start
-
-	log.Println("<INFO> Async connection started")
+var asyncTaskList = []string{
+	"heartbeat",
+	"request-handler",
+	"response-handler",
 }
 
-// This could find a happy home in a generalized worker package ...
-// TODO
-func (c *asyncConnHdl) worker(id int, name string, task workerTask, ctl workerCtl, fb chan workerStatus) {
-	log.Printf("<INFO> %s started.", name)
-	var signal interrupt_code
-	var tstat *taskStatus
-
-	// todo: add startup hook for worker
-
-await_signal:
-	//	log.Println(name, "_worker: await_signal.")
-	signal = <-ctl
-
-on_interrupt:
-	//		log.Println(name, "_worker: on_interrupt: ", signal);
-	switch signal {
-	case stop:
-		goto before_stop
-	case pause:
-		goto await_signal
-	case start:
-		goto work
+func asyncTask(label string) (int, worker.WorkerTask, worker.StartHook, worker.FinishHook) {
+	switch label {
+	case "heartbeat":
+		return heartbeatworker, heartbeatTask, nil, nil
+	case "request-handler":
+		return requesthandler, reqProcessingTask, nil, nil
+	case "response-handler":
+		return responsehandler, rspProcessingTask, nil, nil
 	}
+	return 0, nil, nil, nil
+}
 
-work:
-	//		fmt.Println(name, "_worker: work!");
-	select {
-	case signal = <-ctl:
-		goto on_interrupt
-	default:
-		is, stat := task(c, ctl) // todo is a task context type
-		if stat == nil {
-			log.Println("<BUG> nil stat from worker ", name)
-		}
-		if stat.code != ok {
-			//			fmt.Println(name, "_worker: task error!")
-			tstat = stat
-			goto on_error
-		} else if is != nil {
-			signal = *is
-			goto on_interrupt
-		}
-		goto work
-	}
+func (c *asyncConnHdl) startup() {
 
-on_error:
-	//log.Println(name, "_worker: on_error!")
-	// TODO: log it, send it, and go back to wait_start:
-	log.Println(name, "_worker task raised error: ", tstat)
-	fb <- workerStatus{id, faulted, tstat, &ctl}
-	goto await_signal
+	worker.LoadTasks(c, asyncTaskList, asyncTask)
 
-before_stop:
-	//	fmt.Println(name, "_worker: before_stop!")
-	// TODO: add shutdown hook for worker
-
-	log.Println(name, "_worker: STOPPED!")
+	log.Println("<INFO> Async connection started")
 }
 
 // ----------------------------------------------------------------------------
 // aync tasks
 // ----------------------------------------------------------------------------
 
-func managementTask(c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *taskStatus) {
+func (c *asyncConnHdl) Run() {
 	/* TODO:
 	connected:
 		clearChannels();
@@ -538,27 +436,30 @@ func managementTask(c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *ta
 	on_exit:
 		?
 	*/
+	//	log.Println("MGR: start tasks ...")
+	worker.StartTasks(c)
+	shutdown := c.GetShutdown()
+	status := c.GetStatus()
 	//	log.Println("MGR: do task ...")
-	select {
-	case stat := <-c.feedback:
-		log.Println("MGR: Feedback from one of my minions: ", stat)
-		// do the shutdown for now -- TODO: try reconnect
-		if stat.event == faulted {
-			log.Println("MGR: Shutting down due to fault in ", stat.id)
-			go func() { c.reqProcCtl <- stop }()
-			go func() { c.rspProcCtl <- stop }()
-			go func() { c.heartbeatCtl <- stop }()
-
-			log.Println("MGR: Signal SHUTDOWN ... ")
-			c.shutdown <- true
-			// stop self // TODO: should manager really be a task or a FSM?
-			c.managerCtl <- stop
+	for {
+		select {
+		case stat := <-status:
+			log.Println("MGR: Feedback from one of my minions: ", stat)
+			// do the shutdown for now -- TODO: try reconnect
+			if stat.Event == worker.Faulted {
+				log.Println("MGR: Shutting down due to fault in ", stat.Task.Id)
+				log.Println("MGR: Signal SHUTDOWN ... ")
+				go c.Shutdown()
+			} else if stat.Event == worker.Ready {
+				log.Println("MGR: Starting ", stat.Task.Name)
+				stat.Task.Signal(worker.Start)
+			}
+		case s := <-shutdown:
+			worker.StopTasks(c)
+			s <- true
+			log.Println("MGR: SHUTDOWN ... ")
 		}
-	case s := <-ctl:
-		return &s, &ok_status
 	}
-
-	return nil, &ok_status
 }
 
 // Task:
@@ -571,32 +472,33 @@ func managementTask(c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *ta
 // but it is a good measure of latencies in the pipeline and perhaps could be used
 // to autoconfigure the params to decrease latencies ... TODO
 
-func heartbeatTask(c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *taskStatus) {
+func heartbeatTask(w worker.Worker, ctl worker.WorkerCtl) (sig *worker.InterruptCode, te *worker.TaskStatus) {
+	var c = w.(*asyncConnHdl)
 	var async AsyncConnection = c
 	select {
 	//	case <-NewTimer(ns1Sec * c.super.spec.heartbeat):
 	case <-time.NewTimer(c.super.spec.heartbeat).C:
 		response, e := async.QueueRequest(&PING, [][]byte{})
 		if e != nil {
-			return nil, &taskStatus{reqerr, e}
+			return nil, &worker.TaskStatus{Reqerr, e}
 		}
 		stat, re, timedout := response.future.(FutureBool).TryGet(1 * time.Second)
 		if re != nil {
 			log.Printf("ERROR: Heartbeat recieved error response on PING: %d\n", re)
-			return nil, &taskStatus{error_, re}
+			return nil, &worker.TaskStatus{worker.Error, re}
 		} else if timedout {
 			log.Println("Warning: Heartbeat timeout on get PING response.")
 		} else {
 			// flytrap
 			if stat != true {
 				log.Println("<BUG> Heartbeat recieved false stat on PING while response error was nil")
-				return nil, &taskStatus{error_, NewError(SYSTEM_ERR, "BUG false stat on PING w/out error")}
+				return nil, &worker.TaskStatus{worker.Error, NewError(SYSTEM_ERR, "BUG false stat on PING w/out error")}
 			}
 		}
 	case sig := <-ctl:
-		return &sig, &ok_status
+		return &sig, &worker.OkStatus
 	}
-	return nil, &ok_status
+	return nil, &worker.OkStatus
 }
 
 // Task:
@@ -607,13 +509,14 @@ func heartbeatTask(c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *tas
 // KNOWN BUG:
 // until we figure out what's the problem with read timeout, can not
 // be interrupted if hanging on a read
-func rspProcessingTask(c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *taskStatus) {
+func rspProcessingTask(w worker.Worker, ctl worker.WorkerCtl) (sig *worker.InterruptCode, te *worker.TaskStatus) {
 
 	var req asyncReqPtr
+	var c = w.(*asyncConnHdl)
 	select {
 	case sig := <-ctl:
 		// interrupted
-		return &sig, &ok_status
+		return &sig, &worker.OkStatus
 	case req = <-c.pendingResps:
 		// continue to process
 	}
@@ -626,28 +529,29 @@ func rspProcessingTask(c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te 
 	if e3 != nil {
 		// system error
 		log.Println("<TEMP DEBUG> Request sent to faults chan on error in GetResponse: ", e3)
-		req.stat = rcverr
+		req.stat = Rcverr
 		req.error = NewErrorWithCause(SYSTEM_ERR, "GetResponse os.Error", e3)
 		c.faults <- req
-		return nil, &taskStatus{rcverr, e3}
+		return nil, &worker.TaskStatus{Rcverr, e3}
 	}
 	SetFutureResult(req.future, cmd, resp)
 
-	return nil, &ok_status
+	return nil, &worker.OkStatus
 }
 
 // Pending further tests, this addresses bug in earlier version
 // and can be interrupted
 
-func reqProcessingTask(c *asyncConnHdl, ctl workerCtl) (ic *interrupt_code, ts *taskStatus) {
+func reqProcessingTask(w worker.Worker, ctl worker.WorkerCtl) (ic *worker.InterruptCode, ts *worker.TaskStatus) {
 
 	var err error
 	var errmsg string
+	var c = w.(*asyncConnHdl)
 
 	bytecnt := 0
 	blen := 0
 	bufsize := c.super.spec.wBufSize
-	var sig interrupt_code
+	var sig worker.InterruptCode
 
 	select {
 	case req := <-c.pendingReqs:
@@ -658,7 +562,7 @@ func reqProcessingTask(c *asyncConnHdl, ctl workerCtl) (ic *interrupt_code, ts *
 		}
 		bytecnt += blen
 	case sig := <-ctl:
-		return &sig, &ok_status
+		return &sig, &worker.OkStatus
 	}
 
 	for bytecnt < bufsize {
@@ -686,11 +590,11 @@ func reqProcessingTask(c *asyncConnHdl, ctl workerCtl) (ic *interrupt_code, ts *
 
 done:
 	c.writer.Flush()
-	return ic, &ok_status
+	return ic, &worker.OkStatus
 
 proc_error:
 	log.Println(errmsg, err)
-	return nil, &taskStatus{snderr, err}
+	return nil, &worker.TaskStatus{Snderr, err}
 }
 
 func (c *asyncConnHdl) processAsyncRequest(req asyncReqPtr) (blen int, e error) {
@@ -732,9 +636,12 @@ type PendingResponse struct {
 }
 
 func (c *asyncConnHdl) QueueRequest(cmd *Command, args [][]byte) (*PendingResponse, Error) {
+	shutdown := c.GetShutdown()
 	select {
-	case <-c.shutdown:
+	case s := <-shutdown:
 		log.Println("<DEBUG> we're shutdown and not accepting any more requests ...")
+		// if this happened, put it back for Run() to take care of
+		shutdown <- s
 		return nil, NewError(SYSTEM_ERR, "Connection is shutdown.")
 	default:
 	}
@@ -748,7 +655,7 @@ func (c *asyncConnHdl) QueueRequest(cmd *Command, args [][]byte) (*PendingRespon
 		c.pendingReqs <- request
 	} else {
 		errmsg := fmt.Sprintf("Failed to create asynchrequest - %s aborted", cmd.Code)
-		request.stat = inierr
+		request.stat = Inierr
 		request.error = NewErrorWithCause(SYSTEM_ERR, errmsg, e1) // only makes sense if using go ...
 		request.future.(FutureResult).onError(request.error)
 
