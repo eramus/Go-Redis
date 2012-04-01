@@ -638,10 +638,12 @@ type PendingResponse struct {
 func (c *asyncConnHdl) QueueRequest(cmd *Command, args [][]byte) (*PendingResponse, Error) {
 	shutdown := c.GetShutdown()
 	select {
-	case s := <-shutdown:
+	case s, ok := <-shutdown:
 		log.Println("<DEBUG> we're shutdown and not accepting any more requests ...")
-		// if this happened, put it back for Run() to take care of
-		shutdown <- s
+		if ok {
+			// if this happened when open, put it back for Run() to take care of
+			shutdown <- s
+		}
 		return nil, NewError(SYSTEM_ERR, "Connection is shutdown.")
 	default:
 	}
